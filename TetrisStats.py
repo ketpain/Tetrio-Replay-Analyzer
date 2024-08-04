@@ -277,7 +277,7 @@ class ReplayAnalyzer(QMainWindow):
         super().__init__()
 
         # Set up the main window
-        self.setWindowTitle("Tetris Replay Analyzer")
+        self.setWindowTitle("Tetr.io Replay Analyzer")
         self.setGeometry(100, 100, 1920, 1080)
         self.setStyleSheet("""
             QMainWindow, QWidget { background-color: #2b2b2b; color: #ffffff; }
@@ -317,12 +317,26 @@ class ReplayAnalyzer(QMainWindow):
         select_button = QPushButton("Select Folder")
         select_button.clicked.connect(self.select_folder)
 
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(self.refresh_files)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(select_button)
+        button_layout.addWidget(refresh_button)
+
         file_layout.addWidget(QLabel("Replay Files"))
         file_layout.addWidget(self.file_list)
-        file_layout.addWidget(select_button)
+        file_layout.addLayout(button_layout)
 
-        # Add the file browser to the main splitter
         self.main_splitter.addWidget(file_frame)
+    
+    # Refresh the file list with the current folder contents
+    def refresh_files(self):
+        if self.current_folder:
+            self.file_list.clear()
+            for file_name in os.listdir(self.current_folder):
+                if file_name.endswith('.ttrm'):
+                    self.file_list.addItem(file_name)
 
     # Create the stats view widget
     def create_stats_view(self):
@@ -355,15 +369,12 @@ class ReplayAnalyzer(QMainWindow):
         # Add the stats view to the main splitter
         self.main_splitter.addWidget(stats_frame)
 
-    # Open a folder dialog and populate the file list
+    # Open a file dialog to select a folder
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder_path:
             self.current_folder = folder_path
-            self.file_list.clear()
-            for file_name in os.listdir(folder_path):
-                if file_name.endswith('.ttrm'):
-                    self.file_list.addItem(file_name)
+            self.refresh_files()
 
     # Handle file selection from the list
     def on_file_select(self, item):
