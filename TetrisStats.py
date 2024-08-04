@@ -57,7 +57,6 @@ class FileProcessor(QThread):
         super().__init__()
         self.file_path = file_path
 
-    # Process the replay file and emit the results
     def run(self):
         try:
             with open(self.file_path, 'r') as f:
@@ -66,30 +65,67 @@ class FileProcessor(QThread):
             round_stats = []
             overall_stats = {}
 
-            for round_index, round_data in enumerate(data['replay']['rounds'], 1):
-                round_stats.append({})
-                for player_data in round_data:
-                    stats = player_data['stats']
-                    username = player_data['username']
-                    pps = stats['pps']
-                    apm = stats['apm']
-                    vs = stats['vsscore']
+            # Check for new replay format
+            if 'rounds' in data.get('replay', {}):  # Check 'replay' key safely
+                # New format processing
+                for round_index, round_data in enumerate(data['replay']['rounds'], 1):
+                    round_stats.append({})
+                    for player_data in round_data:
+                        stats = player_data['stats']
+                        username = player_data['username']
+                        pps = stats['pps']
+                        apm = stats['apm']
+                        vs = stats['vsscore']
 
-                    round_stats[-1][username] = {
-                        'PPS': pps,
-                        'APM': apm,
-                        'VS Score': vs,
-                        'APP': calculate_app(apm, pps),
-                        'DS/Piece': calculate_ds_per_piece(vs, apm, pps),
-                        'DS/Second': calculate_ds_per_second(vs, apm),
-                        'Garbage Efficiency': calculate_garbage_efficiency(pps, calculate_ds_per_piece(vs,apm,pps), calculate_app(apm,pps)),
-                    }
+                        round_stats[-1][username] = {
+                            'PPS': pps,
+                            'APM': apm,
+                            'VS Score': vs,
+                            'APP': calculate_app(apm, pps),
+                            'DS/Piece': calculate_ds_per_piece(vs, apm, pps),
+                            'DS/Second': calculate_ds_per_second(vs, apm),
+                            'Garbage Efficiency': calculate_garbage_efficiency(pps, calculate_ds_per_piece(vs,apm,pps), calculate_app(apm,pps)),
+                        }
 
-                    if username not in overall_stats:
-                        overall_stats[username] = {stat: [] for stat in round_stats[-1][username]}
+                        if username not in overall_stats:
+                            overall_stats[username] = {stat: [] for stat in round_stats[-1][username]}
 
-                    for stat, value in round_stats[-1][username].items():
-                        overall_stats[username][stat].append(value)
+                        for stat, value in round_stats[-1][username].items():
+                            overall_stats[username][stat].append(value)
+
+            elif 'data' in data:
+                # Old format processing
+                for round_index, round_data in enumerate(data['data'], 1):
+                    round_stats.append({})
+                    for player_data in round_data['board']:
+                        username = player_data['username']
+                        # Extract stats from 'endcontext'
+                        for endcontext_data in data['endcontext']:
+                            if endcontext_data['username'] == username:
+                                stats = endcontext_data['points']
+                                pps = stats['tertiary']
+                                apm = stats['secondary']
+                                vs = stats['extra']['vs']
+                                break  # Found the matching player in 'endcontext'
+
+                        round_stats[-1][username] = {
+                            'PPS': pps,
+                            'APM': apm,
+                            'VS Score': vs,
+                            'APP': calculate_app(apm, pps),
+                            'DS/Piece': calculate_ds_per_piece(vs, apm, pps),
+                            'DS/Second': calculate_ds_per_second(vs, apm),
+                            'Garbage Efficiency': calculate_garbage_efficiency(pps, calculate_ds_per_piece(vs,apm,pps), calculate_app(apm,pps)),
+                        }
+
+                        if username not in overall_stats:
+                            overall_stats[username] = {stat: [] for stat in round_stats[-1][username]}
+
+                        for stat, value in round_stats[-1][username].items():
+                            overall_stats[username][stat].append(value)
+
+            else:
+                raise ValueError("Unknown replay format")
 
             # Calculate averages for overall stats
             for username in overall_stats:
@@ -192,7 +228,7 @@ class AttackDefenseSpeedChart(QWidget):
         self.stats = {}
         self.players = []
         self.stat_names = ['APP', 'Garbage Efficiency', 'PPS']
-        self.display_names = ['Attack Power', 'Defense', 'Speed']
+        self.display_names = ['Attack Power', 'Defense/Boardstate', 'Speed']
 
     def set_data(self, stats):
         self.stats = stats
