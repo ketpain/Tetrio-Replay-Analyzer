@@ -42,6 +42,8 @@ def calculate_app(apm, pps):
 
 # Calculate DS/Piece based on VS Score, APM, and PPS
 def calculate_ds_per_piece(vs, apm, pps):
+    if pps <= 0 or apm <= 0:
+        return 0
     ds_per_second = (vs / 100) - (apm / 60)
     return ds_per_second / pps
 
