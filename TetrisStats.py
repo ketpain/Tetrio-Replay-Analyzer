@@ -30,7 +30,7 @@ def normalize_stat(value, stat_name):
 
 # Calculate garbage efficiency based on PPS, DS/Second, and APP
 def calculate_garbage_efficiency(pps, ds_per_second, app):
-    if pps <= 0 or app <= 0 or pps <= 0:
+    if pps <= 0 or app <= 0:
         return 0
     return ((app*ds_per_second) / pps) * 2
 
