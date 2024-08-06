@@ -776,7 +776,7 @@ class ReplayAnalyzer(QMainWindow):
             ("High", "Medium", "Low"): "Efficient Upstacker with Strider Tendencies with Bad Downstack/Boardstate",
             ("High", "Low", "High"): "Efficient Upstacker with Superb Downstack/Boardstate",
             ("High", "Low", "Medium"): "Efficient Upstacker with Average Downstack/Boardstate",
-            ("High", "Low", "Low"): "Efficient Upstacker / Opener Main / Strider",
+            ("High", "Low", "Low"): "Efficient Upstacker / Opener Main / Strider / Bad Downstack/Boardstate",
             ("Medium", "High", "High"): "Tanker with Efficient Downstack/Boardstate, Average Upstacker",
             ("Medium", "High", "Medium"): "Tanker with Average Downstack/Boardstate, Average Upstacker",
             ("Medium", "High", "Low"): "Extreme Tanker, Average Upstacker, Highly Cheesey",
