@@ -2,13 +2,14 @@ import sys
 import os
 import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QListWidget, QPushButton, QLabel, QComboBox, QTableWidget, 
-                             QTableWidgetItem, QFileDialog, QHeaderView, QSplitter)
+                             QListWidget, QPushButton, QLabel, QComboBox, QFileDialog, 
+                             QHeaderView, QSplitter, QGridLayout, QFrame, QTableWidget, QTableWidgetItem)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QPainter, QColor, QPen
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 import numpy as np
 
-# Grabbed some of these formulas from Kerrmunism Statsheet Bot
+# Credit to Kermm and most of the formulas
+# https://github.com/Kerrmunism/sheetBot
 
 # Define the ranges for each statistic
 STAT_RANGES = {
@@ -18,7 +19,8 @@ STAT_RANGES = {
     'APP': (0, 1),
     'DS/Piece': (0, 0.5),
     'DS/Second': (0, 1),
-    'Garbage Efficiency': (0, 0.6)
+    'Garbage Efficiency': (0, 0.6),
+    'Damage Potential': (0, 8)
 }
 
 # Normalize a statistic value to a range between 0 and 1
@@ -51,6 +53,10 @@ def calculate_ds_per_piece(vs, apm, pps):
 def calculate_ds_per_second(vs, apm):
     return (vs / 100) - (apm / 60)
 
+# Calculate Damage Potential
+def calculate_damage_potential(pps, app, ge):
+    return pps * (1 + app) * (1 + ge)
+
 # Thread class for processing replay files
 class FileProcessor(QThread):
     finished = pyqtSignal(object, str)
@@ -78,15 +84,21 @@ class FileProcessor(QThread):
                         pps = stats['pps']
                         apm = stats['apm']
                         vs = stats['vsscore']
+                        app = calculate_app(apm, pps)
+                        ds_per_piece = calculate_ds_per_piece(vs, apm, pps)
+                        ds_per_second = calculate_ds_per_second(vs, apm)
+                        garbage_efficiency = calculate_garbage_efficiency(pps, ds_per_piece, app)
+                        damage_potential = calculate_damage_potential(pps, app, garbage_efficiency)
 
                         round_stats[-1][username] = {
                             'PPS': pps,
                             'APM': apm,
                             'VS Score': vs,
-                            'APP': calculate_app(apm, pps),
-                            'DS/Piece': calculate_ds_per_piece(vs, apm, pps),
-                            'DS/Second': calculate_ds_per_second(vs, apm),
-                            'Garbage Efficiency': calculate_garbage_efficiency(pps, calculate_ds_per_piece(vs,apm,pps), calculate_app(apm,pps)),
+                            'APP': app,
+                            'DS/Piece': ds_per_piece,
+                            'DS/Second': ds_per_second,
+                            'Garbage Efficiency': garbage_efficiency,
+                            'Damage Potential': damage_potential
                         }
 
                         if username not in overall_stats:
@@ -110,14 +122,21 @@ class FileProcessor(QThread):
                                 vs = stats['extra']['vs']
                                 break  # Found the matching player in 'endcontext'
 
+                        app = calculate_app(apm, pps)
+                        ds_per_piece = calculate_ds_per_piece(vs, apm, pps)
+                        ds_per_second = calculate_ds_per_second(vs, apm)
+                        garbage_efficiency = calculate_garbage_efficiency(pps, ds_per_piece, app)
+                        damage_potential = calculate_damage_potential(pps, app, garbage_efficiency)
+
                         round_stats[-1][username] = {
                             'PPS': pps,
                             'APM': apm,
                             'VS Score': vs,
-                            'APP': calculate_app(apm, pps),
-                            'DS/Piece': calculate_ds_per_piece(vs, apm, pps),
-                            'DS/Second': calculate_ds_per_second(vs, apm),
-                            'Garbage Efficiency': calculate_garbage_efficiency(pps, calculate_ds_per_piece(vs,apm,pps), calculate_app(apm,pps)),
+                            'APP': app,
+                            'DS/Piece': ds_per_piece,
+                            'DS/Second': ds_per_second,
+                            'Garbage Efficiency': garbage_efficiency,
+                            'Damage Potential': damage_potential
                         }
 
                         if username not in overall_stats:
@@ -229,8 +248,8 @@ class AttackDefenseSpeedChart(QWidget):
         super().__init__(parent)
         self.stats = {}
         self.players = []
-        self.stat_names = ['APP', 'Garbage Efficiency', 'PPS']
-        self.display_names = ['Attack Power', 'Defense/Boardstate', 'Speed']
+        self.stat_names = ['APP', 'Garbage Efficiency', 'PPS', 'Damage Potential']
+        self.display_names = ['Attack Power', 'Defense/Boardstate', 'Speed', 'Damage Potential']
 
     def set_data(self, stats):
         self.stats = stats
@@ -309,6 +328,100 @@ class AttackDefenseSpeedChart(QWidget):
             painter.drawText(legend_x + 25, legend_y + 15, player)
             legend_x += 175  # Move to the next legend item
 
+class PlayerStatsWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+    def update_stats(self, stats):
+        # Clear previous widgets
+        for i in reversed(range(self.layout.count())): 
+            self.layout.itemAt(i).widget().setParent(None)
+
+        players = list(stats.keys())
+        stat_names = ['PPS', 'APM', 'VS Score', 'APP', 'DS/Piece', 'DS/Second', 'Garbage Efficiency']
+
+        # Create table widget
+        table = QTableWidget(len(stat_names) + 2, 3)  # +2 for header row and winner row
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.horizontalHeader().setVisible(False)
+        table.verticalHeader().setVisible(False)
+
+        # Set column widths
+        table.setColumnWidth(0, 250)  # Stat names
+        table.setColumnWidth(1, 250)  # Player 1 stats
+        table.setColumnWidth(2, 250)  # Player 2 stats
+
+        # Set row height
+        for row in range(table.rowCount()):
+            table.setRowHeight(row, 30)  # Increased row height
+
+        # Add player names
+        colors = [QColor(0, 150, 255), QColor(255, 50, 50)]
+        for col, player in enumerate(players[:2], start=1):
+            item = QTableWidgetItem(player)
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setBackground(colors[col-1])
+            item.setForeground(QColor(255, 255, 255))
+            font = item.font()
+            font.setBold(True)
+            font.setPointSize(12)  # Increased font size
+            item.setFont(font)
+            table.setItem(0, col, item)
+
+        # Add stats
+        for row, stat in enumerate(stat_names, start=1):
+            # Stat name
+            item = QTableWidgetItem(stat)
+            item.setTextAlignment(Qt.AlignCenter)  # Center-aligned
+            font = item.font()
+            font.setPointSize(11)  # Increased font size
+            item.setFont(font)
+            table.setItem(row, 0, item)
+
+            # Player stats
+            for col, player in enumerate(players[:2], start=1):
+                value = stats[player][stat]
+                item = QTableWidgetItem(f"{value:.2f}")
+                item.setTextAlignment(Qt.AlignCenter)  # Center-aligned
+                font = item.font()
+                font.setPointSize(11)  # Increased font size
+                item.setFont(font)
+                table.setItem(row, col, item)
+
+        # Add winner indicator
+        winner = max(stats, key=lambda x: stats[x]['VS Score'])
+        winner_row = len(stat_names) + 1
+        for col, player in enumerate(players[:2], start=1):
+            item = QTableWidgetItem("WINNER" if player == winner else "")
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setBackground(QColor('#4CAF50') if player == winner else QColor('#2b2b2b'))
+            item.setForeground(QColor(255, 255, 255))
+            font = item.font()
+            font.setBold(True)
+            font.setPointSize(12)  # Increased font size
+            item.setFont(font)
+            table.setItem(winner_row, col, item)
+
+        self.layout.addWidget(table)
+
+        # Add some styling
+        self.setStyleSheet("""
+            QTableWidget { 
+                background-color: #2b2b2b; 
+                color: #ffffff; 
+                gridline-color: #3a3a3a;
+            }
+            QTableWidget::item { 
+                padding: 5px; 
+            }
+        """)
+
+        self.update()
+        
 # Main application window
 class ReplayAnalyzer(QMainWindow):
     def __init__(self):
@@ -384,9 +497,7 @@ class ReplayAnalyzer(QMainWindow):
         self.round_selector = QComboBox()
         self.round_selector.currentIndexChanged.connect(self.on_round_select)
 
-        self.stats_table = QTableWidget()
-        self.stats_table.setColumnCount(3)
-        self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.player_stats_widget = PlayerStatsWidget()
 
         self.radar_chart = RadarChart()
         self.attack_defense_speed_chart = AttackDefenseSpeedChart()
@@ -396,7 +507,7 @@ class ReplayAnalyzer(QMainWindow):
         charts_splitter.addWidget(self.attack_defense_speed_chart)
 
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.stats_table)
+        splitter.addWidget(self.player_stats_widget)
         splitter.addWidget(charts_splitter)
         splitter.setSizes([200, 400])  # Adjust these values to change the relative sizes
 
@@ -440,39 +551,26 @@ class ReplayAnalyzer(QMainWindow):
         self.round_selector.addItems([f"Round {i+1}" for i in range(len(round_stats))] + ["Average"])
         self.round_selector.setCurrentIndex(len(round_stats))
 
-        self.update_stats_table(overall_stats)
-        self.update_graph(overall_stats)
+        self.update_stats_display(overall_stats)
+        self.update_graphs(overall_stats)
 
     # Handle match round selection from the dropdown
     def on_round_select(self, index):
         if self.current_file:
             round_stats, overall_stats = self.all_game_data[self.current_file]
             if index == self.round_selector.count() - 1:
-                self.update_stats_table(overall_stats)
-                self.update_graph(overall_stats)
+                self.update_stats_display(overall_stats)
+                self.update_graphs(overall_stats)
             else:
-                self.update_stats_table(round_stats[index])
-                self.update_graph(round_stats[index])
+                self.update_stats_display(round_stats[index])
+                self.update_graphs(round_stats[index])
 
-    # Update the stats table with the current data
-    def update_stats_table(self, stats):
-        self.stats_table.setRowCount(7)
-        stat_names = ['PPS', 'APM', 'VS Score', 'APP', 'DS/Piece', 'DS/Second', 'Garbage Efficiency']
-        players = list(stats.keys())
-
-        self.stats_table.setHorizontalHeaderLabels(["Stat"] + players[:2])
-
-        for i, stat in enumerate(stat_names):
-            self.stats_table.setItem(i, 0, QTableWidgetItem(stat))
-            for j, player in enumerate(players[:2]):
-                value = stats[player][stat]
-                self.stats_table.setItem(i, j+1, QTableWidgetItem(f"{value:.2f}"))
-
-        self.stats_table.resizeColumnsToContents()
-        self.stats_table.resizeRowsToContents()
+    # Update the stats display with the current data
+    def update_stats_display(self, stats):
+        self.player_stats_widget.update_stats(stats)
 
     # Update both charts with the current data
-    def update_graph(self, stats):
+    def update_graphs(self, stats):
         self.radar_chart.set_data(stats)
         self.radar_chart.update()
         self.attack_defense_speed_chart.set_data(stats)
