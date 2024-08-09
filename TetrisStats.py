@@ -2,24 +2,27 @@ import sys
 import os
 import json
 import colorsys
+import multiprocessing
+from functools import partial
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QListWidget, QPushButton, QLabel, QComboBox, QFileDialog, 
                              QHeaderView, QSplitter, QGridLayout, QFrame, QTableWidget, QTableWidgetItem,
-                             QAbstractItemView, QTabWidget, QLineEdit, QScrollArea, QDialog, QFormLayout, QDoubleSpinBox)
+                             QAbstractItemView, QTabWidget, QLineEdit, QScrollArea, QDialog, QFormLayout, QDoubleSpinBox,
+                             QProgressBar, QMessageBox,QProgressDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 import numpy as np
 
 # Define the ranges for each statistic
 STAT_RANGES = {
-    'PPS': (0, 4), #Pieces per second
-    'APM': (0, 240), #Attacks Per Minute
-    'VS Score': (0, 400), #Versus Score
-    'APP': (0, 1), #Attacks Per Piece
-    'DS/Piece': (0, 0.5), #Downstacks Per Piece
-    'DS/Second': (0, 1), #Downstacks Per Second
-    'Garbage Efficiency': (0, 0.6), #Garbage Efficiency
-    'Damage Potential': (0, 8) #Damage Potential
+    'PPS': (0, 4),
+    'APM': (0, 240),
+    'VS Score': (0, 400),
+    'APP': (0, 1),
+    'DS/Piece': (0, 0.5),
+    'DS/Second': (0, 1),
+    'Garbage Efficiency': (0, 0.6),
+    'Damage Potential': (0, 8)
 }
 
 def generate_distinct_colors(n):
@@ -103,23 +106,32 @@ class PlayerProfile:
                            'total_games': wins['wins'] + wins['losses']}
                 for opponent, wins in self.matchups.items()}
 
-class FileProcessor(QThread):
-    finished = pyqtSignal(object, str)
+def process_file(file_path, cache_dir):
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{os.path.basename(file_path)}.cache")
+        
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+                if len(cached_data) == 3:  # Check if the cached data has winner information
+                    return cached_data
+                # If not, we'll reprocess the file
+        
+        with open(file_path, 'r') as f:
+            data = json.load(f)
 
-    def __init__(self, file_path):
-        super().__init__()
-        self.file_path = file_path
-        self.result = None
+        round_stats = []
+        overall_stats = {}
+        winner = None
 
-    def run(self):
-        try:
-            with open(self.file_path, 'r') as f:
-                data = json.load(f)
+        if 'replay' in data:
+            # Determine the winner
+            if 'leaderboard' in data['replay']:
+                leaderboard = data['replay']['leaderboard']
+                winner = max(leaderboard, key=lambda x: x['wins'])['username']
 
-            round_stats = []
-            overall_stats = {}
-
-            if 'rounds' in data.get('replay', {}):
+            if 'rounds' in data['replay']:
                 for round_index, round_data in enumerate(data['replay']['rounds'], 1):
                     round_stats.append({})
                     for player_data in round_data:
@@ -151,54 +163,31 @@ class FileProcessor(QThread):
                         for stat, value in round_stats[-1][username].items():
                             overall_stats[username][stat].append(value)
 
-            elif 'data' in data:
-                for round_index, round_data in enumerate(data['data'], 1):
-                    round_stats.append({})
-                    for player_data in round_data['board']:
-                        username = player_data['username']
-                        for endcontext_data in data['endcontext']:
-                            if endcontext_data['username'] == username:
-                                stats = endcontext_data['points']
-                                pps = stats['tertiary']
-                                apm = stats['secondary']
-                                vs = stats['extra']['vs']
-                                break
+        else:
+            raise ValueError("Unknown replay format")
 
-                        app = calculate_app(apm, pps)
-                        ds_per_piece = calculate_ds_per_piece(vs, apm, pps)
-                        ds_per_second = calculate_ds_per_second(vs, apm)
-                        garbage_efficiency = calculate_garbage_efficiency(pps, ds_per_piece, app)
-                        damage_potential = calculate_damage_potential(pps, app, garbage_efficiency)
+        for username in overall_stats:
+            for stat in overall_stats[username]:
+                overall_stats[username][stat] = sum(overall_stats[username][stat]) / len(overall_stats[username][stat])
 
-                        round_stats[-1][username] = {
-                            'PPS': pps,
-                            'APM': apm,
-                            'VS Score': vs,
-                            'APP': app,
-                            'DS/Piece': ds_per_piece,
-                            'DS/Second': ds_per_second,
-                            'Garbage Efficiency': garbage_efficiency,
-                            'Damage Potential': damage_potential
-                        }
+        result = (round_stats, overall_stats, winner)
+        
+        with open(cache_file, 'w') as f:
+            json.dump(result, f)
+        
+        return result
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return [], {}, None  # Return empty data and None for winner in case of error
 
-                        if username not in overall_stats:
-                            overall_stats[username] = {stat: [] for stat in round_stats[-1][username]}
-
-                        for stat, value in round_stats[-1][username].items():
-                            overall_stats[username][stat].append(value)
-
-            else:
-                raise ValueError("Unknown replay format")
-
-            for username in overall_stats:
-                for stat in overall_stats[username]:
-                    overall_stats[username][stat] = sum(overall_stats[username][stat]) / len(overall_stats[username][stat])
-
-            self.result = (round_stats, overall_stats)
-            self.finished.emit(self.result, os.path.basename(self.file_path))
-        except Exception as e:
-            print(f"Error processing file {self.file_path}: {str(e)}")
-            self.result = None
+def batch_process_files(file_paths, cache_dir, batch_size=10):
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    with multiprocessing.Pool() as pool:
+        process_func = partial(process_file, cache_dir=cache_dir)
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i:i+batch_size]
+            yield pool.map(process_func, batch)
 
 class RadarChart(QWidget):
     def __init__(self, parent=None):
@@ -288,19 +277,19 @@ class ManualInputDialog(QDialog):
         form_layout = QFormLayout()
         
         self.pps_input = QDoubleSpinBox()
-        self.pps_input.setRange(0, 10)  # Adjust if needed
+        self.pps_input.setRange(0, 10)
         self.pps_input.setDecimals(2)
         self.pps_input.setSingleStep(0.1)
         self.pps_input.setToolTip("Typical range: 0.1 - 4.5")
         
         self.apm_input = QDoubleSpinBox()
-        self.apm_input.setRange(0, 500)  # Increased to 500
+        self.apm_input.setRange(0, 500)
         self.apm_input.setDecimals(2)
         self.apm_input.setSingleStep(1)
         self.apm_input.setToolTip("Typical range: 1 - 350")
         
         self.vs_input = QDoubleSpinBox()
-        self.vs_input.setRange(0, 1000)  # Increased to 1000 to be safe
+        self.vs_input.setRange(0, 1000)
         self.vs_input.setDecimals(2)
         self.vs_input.setSingleStep(1)
         self.vs_input.setToolTip("Typical range: 1 - 500")
@@ -415,12 +404,11 @@ class PlayerStatsWidget(QWidget):
         self.scroll_area.setWidget(self.scroll_content)
         self.layout.addWidget(self.scroll_area)
 
-    def update_stats(self, stats):
-        # Clear existing widgets
+    def update_stats(self, stats, winner=None):
         for i in reversed(range(self.scroll_layout.count())): 
             self.scroll_layout.itemAt(i).widget().setParent(None)
 
-        if not stats:  # Handle empty stats
+        if not stats:
             empty_label = QLabel("No data to display")
             empty_label.setAlignment(Qt.AlignCenter)
             self.scroll_layout.addWidget(empty_label)
@@ -471,7 +459,6 @@ class PlayerStatsWidget(QWidget):
                 item.setFont(font)
                 table.setItem(row, col, item)
 
-        winner = max(stats, key=lambda x: stats[x]['VS Score'])
         winner_row = len(stat_names) + 1
         for col, player in enumerate(players, start=1):
             item = QTableWidgetItem("WINNER" if player == winner else "")
@@ -516,7 +503,8 @@ class ReplayAnalyzer(QMainWindow):
             QTabBar::tab:selected { background-color: #4a4a4a; }
             QLineEdit { background-color: #3a3a3a; color: #ffffff; border: 1px solid #505050; padding: 5px; }
         """)
-
+        self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replay_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QHBoxLayout(self.central_widget)
@@ -533,13 +521,18 @@ class ReplayAnalyzer(QMainWindow):
         self.current_file = None
         self.current_folder = None
         self.player_profiles = {}
+        self.cache_dir = "replay_cache"
+
+    def create_large_font(self):
+        font = QFont()
+        font.setPointSize(12)
+        return font
 
     def manual_input(self):
         dialog = ManualInputDialog(self)
         if dialog.exec_():
             manual_stats = dialog.get_values()
 
-            # Calculate derived stats
             pps = manual_stats['PPS']
             apm = manual_stats['APM']
             vs = manual_stats['VS Score']
@@ -558,7 +551,6 @@ class ReplayAnalyzer(QMainWindow):
                 'Damage Potential': damage_potential
             })
 
-            # Display the manually input stats
             self.update_stats_display({'Manual Input': manual_stats})
             self.update_graphs({'Manual Input': manual_stats})
 
@@ -586,7 +578,7 @@ class ReplayAnalyzer(QMainWindow):
         button_layout.addWidget(select_button)
         button_layout.addWidget(refresh_button)
         button_layout.addWidget(analyze_button)
-        button_layout.addWidget(manual_input_button)  # Add the new button here
+        button_layout.addWidget(manual_input_button)
 
         file_layout.addWidget(QLabel("Replay Files"))
         file_layout.addWidget(self.file_list)
@@ -632,7 +624,7 @@ class ReplayAnalyzer(QMainWindow):
         main_splitter = QSplitter(Qt.Vertical)
         main_splitter.addWidget(splitter)
         main_splitter.addWidget(self.profile_tabs)
-        main_splitter.setSizes([400, 200])  # Adjust these values as needed
+        main_splitter.setSizes([400, 200])
     
         stats_layout.addWidget(main_splitter)
     
@@ -651,40 +643,32 @@ class ReplayAnalyzer(QMainWindow):
             self.current_folder = folder_path
             self.refresh_files()
 
-    def on_file_select(self, item):
-        file_name = item.text()
-        if file_name not in self.all_game_data:
-            file_path = os.path.join(self.current_folder, file_name)
-            self.processor = FileProcessor(file_path)
-            self.processor.finished.connect(self.on_file_processed)
-            self.processor.start()
-        else:
-            self.display_results(file_name)
-
     def on_file_selection_changed(self):
         selected_items = self.file_list.selectedItems()
         if len(selected_items) == 1:
             self.on_file_select(selected_items[0])
         elif len(selected_items) > 1:
-            # Multiple files selected, prepare for analysis
             self.clear_player_profiles()
             self.player_stats_widget.update_stats({})
             self.radar_chart.set_data({})
             self.attack_defense_speed_chart.set_data({})
             self.round_selector.clear()
         else:
-            # No files selected
             self.clear_player_profiles()
             self.player_stats_widget.update_stats({})
             self.radar_chart.set_data({})
             self.attack_defense_speed_chart.set_data({})
             self.round_selector.clear()
 
-    def on_file_processed(self, data_tuple, file_name):
-        round_stats, overall_stats = data_tuple
-        self.all_game_data[file_name] = (round_stats, overall_stats)
-        self.update_player_profiles(overall_stats)
-        self.display_results(file_name)
+    def on_file_select(self, item):
+        file_name = item.text()
+        file_path = os.path.join(self.current_folder, file_name)
+        result = process_file(file_path, self.cache_dir)
+        if result:
+            self.all_game_data[file_name] = result
+            self.display_results(file_name)
+        else:
+            QMessageBox.warning(self, "Error", f"Failed to process file: {file_name}")
 
     def update_player_profiles(self, game_data):
         for player, stats in game_data.items():
@@ -705,7 +689,6 @@ class ReplayAnalyzer(QMainWindow):
             self.update_stats_display(filtered_stats)
             self.update_graphs(filtered_stats)
 
-            # Update round selector if needed
             current_round = self.round_selector.currentIndex()
             if current_round < len(round_stats):
                 filtered_round_stats = {player: stats for player, stats in round_stats[current_round].items() if filter_text in player.lower()}
@@ -714,15 +697,20 @@ class ReplayAnalyzer(QMainWindow):
 
     def display_results(self, file_name):
         self.current_file = file_name
-        round_stats, overall_stats = self.all_game_data[file_name]
+        data = self.all_game_data[file_name]
+        if len(data) == 3:
+            round_stats, overall_stats, winner = data
+        else:
+            round_stats, overall_stats = data
+            winner = None
 
-        self.clear_player_profiles()  # Clear existing profiles
+        self.clear_player_profiles()
 
         self.round_selector.clear()
         self.round_selector.addItems([f"Round {i+1}" for i in range(len(round_stats))] + ["Average"])
         self.round_selector.setCurrentIndex(len(round_stats))
 
-        self.update_stats_display(overall_stats)
+        self.update_stats_display(overall_stats, winner)
         self.update_graphs(overall_stats)
         self.update_player_profiles(overall_stats)
         self.update_player_profiles_display()
@@ -731,136 +719,208 @@ class ReplayAnalyzer(QMainWindow):
         while self.profile_tabs.count() > 0:
             self.profile_tabs.removeTab(0)
 
+        large_font = self.create_large_font()
+
         for player, profile in self.player_profiles.items():
             tab = QWidget()
             layout = QVBoxLayout(tab)
 
             style = self.analyze_play_style(profile)
-            layout.addWidget(QLabel(f"Play Style: {style}"))
+            style_label = QLabel(f"Play Style: {style}")
+            style_label.setFont(large_font)
+            layout.addWidget(style_label)
 
             suggestions = self.get_improvement_suggestions(profile)
             suggestions_label = QLabel("Improvement Suggestions:")
+            suggestions_label.setFont(large_font)
             layout.addWidget(suggestions_label)
             for suggestion in suggestions:
-                layout.addWidget(QLabel(f"- {suggestion}"))
+                suggestion_label = QLabel(f"- {suggestion}")
+                suggestion_label.setFont(large_font)
+                suggestion_label.setWordWrap(True)
+                layout.addWidget(suggestion_label)
 
             self.profile_tabs.addTab(tab, player)
 
-        # Make the profile box smaller and adjustable
-        self.profile_tabs.setMaximumHeight(300)
-        self.profile_tabs.setMinimumHeight(100)
+        self.profile_tabs.setMaximumHeight(400)
+        self.profile_tabs.setMinimumHeight(150)
 
     def analyze_play_style(self, player_profile):
         averages = player_profile.get_averages()
         app = averages['APP']
-        vs_apm_ratio = averages['VS Score'] / averages['APM']
+        vs_apm_ratio = averages['VS Score'] / averages['APM'] if averages['APM'] > 0 else 0
         ge = averages['Garbage Efficiency']
+        pps = averages['PPS']
 
-        # Define thresholds
-        app_thresholds = [0.40, 0.80]  # Low, Medium, High
-        ge_thresholds = [0.1, 0.3]   # Low, Medium, High
-        vs_apm_thresholds = [2.0, 2.2]  # Low, Medium, High
+        app_thresholds = [0.3, 0.45, 0.6, 0.75, 0.9]
+        ge_thresholds = [0.05, 0.10, 0.15, 0.20, 0.30]
+        vs_apm_thresholds = [1.6, 1.9, 2.0, 2.2, 2.5]
+        pps_thresholds = [1.0, 2.0, 2.5, 3.0, 4]
+        
+        def categorize(value, thresholds):
+            categories = ["Low", "Below Average", "Average", "Above Average", "High", "Extremely High", "God-Tier"]
+            for i, threshold in enumerate(thresholds):
+                if value < threshold:
+                    return categories[i]
+            return categories[-1]
 
-        # Categorize each stat
-        app_category = "Low" if app < app_thresholds[0] else "High" if app >= app_thresholds[1] else "Medium"
-        ge_category = "Low" if ge < ge_thresholds[0] else "High" if ge >= ge_thresholds[1] else "Medium"
-        vs_apm_category = "Low" if vs_apm_ratio < vs_apm_thresholds[0] else "High" if vs_apm_ratio >= vs_apm_thresholds[1] else "Medium"
+        app_category = categorize(app, app_thresholds)
+        ge_category = categorize(ge, ge_thresholds)
+        vs_apm_category = categorize(vs_apm_ratio, vs_apm_thresholds)
+        pps_category = categorize(pps, pps_thresholds)
 
-        # Determine playstyle based on the new categories
-        playstyle_map = {
-            ("High", "High", "High"): "Efficiency God with God-like Downstack/Boardstate",
-            ("High", "High", "Medium"): "Efficient Upstacker with Average Downstack/Boardstate",
-            ("High", "High", "Low"): "Efficient Upstacker with Bad Downstack/Boardstate",
-            ("High", "Medium", "High"): "Efficient Upstacker with Strider Tendencies",
-            ("High", "Medium", "Medium"): "Efficient Upstacker with Strider Tendencies and Average Downstack/Boardstate",
-            ("High", "Medium", "Low"): "Efficient Upstacker with Strider Tendencies with Bad Downstack/Boardstate",
-            ("High", "Low", "High"): "Efficient Upstacker with Superb Downstack/Boardstate",
-            ("High", "Low", "Medium"): "Efficient Upstacker with Average Downstack/Boardstate",
-            ("High", "Low", "Low"): "Efficient Upstacker / Opener Main / Strider / Bad Downstack/Boardstate",
-            ("Medium", "High", "High"): "Tanker with Efficient Downstack/Boardstate, Average Upstacker",
-            ("Medium", "High", "Medium"): "Tanker with Average Downstack/Boardstate, Average Upstacker",
-            ("Medium", "High", "Low"): "Extreme Tanker, Average Upstacker, Highly Cheesey",
-            ("Medium", "Medium", "High"): "Efficient Downstack/Boardstate, Average Upstacker",
-            ("Medium", "Medium", "Medium"): "All-rounder",
-            ("Medium", "Medium", "Low"): "All-rounder with Bad Downstack/Boardstate",
-            ("Medium", "Low", "High"): "Efficient Downstack/Boardstate, Strider, Average Upstacker",
-            ("Medium", "Low", "Medium"): "Average Upstacker, Strider, Average Downstack/Boardstate",
-            ("Medium", "Low", "Low"): "Upstacker, Strider, Bad Downstack/Boardstate",
-            ("Low", "High", "High"): "Efficient Downstack/Boardstate, Tanker, Bad Upstacker",
-            ("Low", "High", "Medium"): "Average Downstack/Boardstate, Tanker, Bad Upstacker",
-            ("Low", "High", "Low"): "Extreme Tanker, Bad Upstacker, Bad Downstack/Boardstate",
-            ("Low", "Medium", "High"): "Efficient Downstacker, Average Tank Tendencies, Bad Upstacker",
-            ("Low", "Medium", "Medium"): "Average Tanker, Average Downstack/Boardstate, Bad Upstacker",
-            ("Low", "Medium", "Low"): "Bad Upstacker, Average Tanker, Bad Downstack/Boardstate",
-            ("Low", "Low", "High"): "Efficient Downstack/Boardstate, Bad Upstacker, Strider",
-            ("Low", "Low", "Medium"): "Bad Upstacker, Strider, Average Downstack/Boardstate",
-            ("Low", "Low", "Low"): "Extreme Strider / Cheeser"
+        speed_descriptors = {
+            "Low": "Very low-speed",
+            "Below Average": "Low-speed",
+            "Average": "Medium-speed",
+            "Above Average": "High-speed",
+            "High": "Very high-speed",
+            "Extremely High": "Extremely high-speed",
+            "God-Tier": "God Tier-speed"
         }
+        speed_descriptor = speed_descriptors[pps_category]
 
-        return playstyle_map.get((app_category, vs_apm_category, ge_category), "Unclassified Playstyle")
+        if app_category in ["God-Tier", "Extremely High"]:
+            attack_style = "Highly efficient attacker"
+        elif app_category in ["High", "Above Average"]:
+            attack_style = "Efficient attacker"
+        elif app_category == "Average":
+            attack_style = "Balanced attacker"
+        else:
+            attack_style = "Inefficient attacker"
 
+        if vs_apm_category in ["Low", "Below Average"]:
+            if pps_category in ["High", "Extremely High", "God-Tier"]:
+                aggressiveness = "Highly offensive"
+            elif pps_category in ["Above Average", "Average"]:
+                aggressiveness = "Offensive"
+            else:
+                aggressiveness = "Low-pressure player"
+        elif vs_apm_category in ["Average", "Above Average"]:
+            aggressiveness = "Balanced"
+        else:
+            if ge_category in ["High", "Extremely High", "God-Tier"]:
+                aggressiveness = "Defensive specialist"
+            elif ge_category in ["Above Average", "Average"]:
+                aggressiveness = "Pressure-resistant"
+            else:
+                aggressiveness = "Defensive struggler"
+
+        if vs_apm_category in ["God-Tier", "Extremely High", "High"]:
+            if ge_category in ["God-Tier", "Extremely High", "High"]:
+                garbage_style = "Exceptional garbage handler under extreme pressure"
+            elif ge_category in ["Above Average", "Average"]:
+                garbage_style = "Competent garbage handler under high pressure"
+            else:
+                garbage_style = "Struggles with efficiency under high pressure"
+        elif vs_apm_category in ["Above Average", "Average"]:
+            if ge_category in ["God-Tier", "Extremely High", "High"]:
+                garbage_style = "Highly efficient garbage handler under moderate pressure"
+            elif ge_category in ["Above Average", "Average"]:
+                garbage_style = "Balanced garbage handling under moderate pressure"
+            else:
+                garbage_style = "Inefficient garbage handler under moderate pressure"
+        else:
+            if ge_category in ["God-Tier", "Extremely High", "High"]:
+                garbage_style = "Highly efficient garbage handler with low incoming pressure"
+            elif ge_category in ["Above Average", "Average"]:
+                garbage_style = "Competent garbage handler with low incoming pressure"
+            else:
+                garbage_style = "Inefficient garbage handling, even under low pressure"
+
+        playstyle = f"{speed_descriptor}, {aggressiveness} player with {attack_style.lower()} capabilities. {garbage_style}."
+
+        if vs_apm_category in ["God-Tier", "Extremely High", "High"] and app_category in ["God-Tier", "Extremely High", "High"]:
+            playstyle += " Excels in high-pressure situations with efficient counterattacks."
+        elif vs_apm_category in ["Low", "Below Average"] and pps_category in ["High", "Extremely High", "God-Tier"]:
+            playstyle += " Dominates through relentless offensive pressure."
+        elif vs_apm_category in ["God-Tier", "Extremely High", "High"] and ge_category in ["God-Tier", "Extremely High", "High"]:
+            playstyle += " Thrives on efficient downstacking under extreme pressure."
+        elif vs_apm_category in ["Low", "Below Average"] and app_category in ["High", "Extremely High", "God-Tier"]:
+            playstyle += " Efficiently converts opportunities into strong attacks."
+
+        return playstyle
 
     def get_improvement_suggestions(self, player_profile):
-        global_averages = self.calculate_global_averages()
-        player_averages = player_profile.get_averages()
-        suggestions = set()
-        below_average_count = 0
-        slightly_below_average_count = 0
-    
-        for stat, value in player_averages.items():
-            diff = (value - global_averages[stat]) / global_averages[stat]
-    
-            if diff < -0.1:
-                below_average_count += 1
-                if stat == 'PPS':
-                    suggestions.add("Work on increasing your piece placement speed.")
-                elif stat == 'APM':
-                    suggestions.add("Focus on improving your attack rate (Attacks Per Minute).")
-                elif stat == 'VS Score':
-                    suggestions.add("Try to increase your overall efficiency in sending effective garbage.")
-                elif stat == 'APP':
-                    suggestions.add("Work on improving your attack per piece.")
-                elif stat == 'Garbage Efficiency':
-                    suggestions.add("Focus on improving your defensive capabilities and downstacking efficiency.")
-            elif -0.1 <= diff < -0.05:
-                slightly_below_average_count += 1
-    
-        # Add general suggestions based on overall performance
-        if not suggestions:
-            if slightly_below_average_count > 0:
-                suggestions.add("Your performance is close to average in most areas. Focus on gradual improvement across all aspects of your game.")
-            elif below_average_count == 0 and slightly_below_average_count == 0:
-                suggestions.add("Your performance is above average in all areas. To improve further, analyze top players and try to refine your techniques.")
-    
-        # Add suggestions for balanced improvement if needed
-        if len(suggestions) <= 2:
-            attack_score = (player_averages['APP'] + player_averages['APM'] / 60) / 2
-            defense_score = player_averages['Garbage Efficiency']
-            speed_score = player_averages['PPS']
-    
-            min_score = min(attack_score, defense_score, speed_score)
-            if min_score == attack_score:
-                suggestions.add("Consider focusing on improving your overall attacking capabilities.")
-            elif min_score == defense_score:
-                suggestions.add("You might benefit from enhancing your defensive play and garbage handling.")
-            elif min_score == speed_score:
-                suggestions.add("Improving your overall game speed could be beneficial.")
-    
-        # Add a general suggestion for well-rounded improvement
-        if len(suggestions) < 3:
-            suggestions.add("Continue to practice and aim for consistent improvement across all aspects of your gameplay.")
-    
-        return list(suggestions)
-    
-    def calculate_global_averages(self):
-        all_stats = {stat: [] for stat in self.player_profiles[list(self.player_profiles.keys())[0]].stats}
-        for profile in self.player_profiles.values():
-            for stat, values in profile.stats.items():
-                all_stats[stat].extend(values)
-        return {stat: sum(values) / len(values) if values else 0 for stat, values in all_stats.items()}
+        averages = player_profile.get_averages()
+        app = averages['APP']
+        vs_apm_ratio = averages['VS Score'] / averages['APM'] if averages['APM'] > 0 else 0
+        ge = averages['Garbage Efficiency']
+        pps = averages['PPS']
 
-    def update_stats_display(self, stats):
-        self.player_stats_widget.update_stats(stats)
+        app_thresholds = [0.3, 0.45, 0.6, 0.75, 0.9]
+        ge_thresholds = [0.05, 0.10, 0.15, 0.20, 0.30]
+        vs_apm_thresholds = [1.6, 1.9, 2.0, 2.2, 2.5]
+        pps_thresholds = [1.0, 2.0, 2.5, 3.0, 4]
+
+        def categorize(value, thresholds):
+            categories = ["Low", "Below Average", "Average", "Above Average", "High", "Extremely High", "God-Tier"]
+            for i, threshold in enumerate(thresholds):
+                if value < threshold:
+                    return categories[i]
+            return categories[-1]
+
+        app_category = categorize(app, app_thresholds)
+        ge_category = categorize(ge, ge_thresholds)
+        vs_apm_category = categorize(vs_apm_ratio, vs_apm_thresholds)
+        pps_category = categorize(pps, pps_thresholds)
+
+        suggestions = []
+
+        if pps_category == "God-Tier":
+            suggestions.append("Your speed is phenomenal. Focus on maintaining this level while optimizing efficiency, attack power, and consistency under varying pressure situations.")
+        elif pps_category in ["Extremely High", "High"]:
+            suggestions.append("Your speed is excellent. Work on consistency and efficiency at these high speeds.")
+        elif pps_category in ["Above Average", "Average"]:
+            suggestions.append("Your speed is good. Continue to improve by practicing finesse and efficient piece placement.")
+        else:
+            suggestions.append("Focus on increasing your overall speed (PPS). Practice finesse and efficient piece placement.")
+
+        if ge_category == "God-Tier":
+            suggestions.append("Your garbage efficiency is outstanding. Maintain this level while optimizing other aspects of your game.")
+        elif ge_category in ["Extremely High", "High"]:
+            suggestions.append("Your garbage efficiency is very good. Fine-tune your downstacking for even better performance under pressure.")
+        elif ge_category in ["Above Average", "Average"]:
+            suggestions.append("Your garbage efficiency is decent. Practice more efficient downstacking techniques to improve further.")
+        else:
+            suggestions.append("Work on improving your garbage efficiency. Focus on cleaner downstacking and better piece placement.")
+
+        if app_category == "God-Tier":
+            suggestions.append("Your attack efficiency is incredible. Focus on maintaining this level while adapting to different board states and opponent playstyles.")
+        elif app_category in ["Extremely High", "High"]:
+            suggestions.append("Your attack efficiency is very good. Work on consistency and adapting to different situations.")
+        elif app_category in ["Above Average", "Average"]:
+            suggestions.append("Your attack efficiency is solid. Practice more advanced attack techniques to increase your APP.")
+        else:
+            suggestions.append("Improve your attack efficiency (APP). Practice building cleaner and executing attacks faster.")
+
+        if vs_apm_category in ["High", "Extremely High", "God-Tier"] and app_category in ["High", "Extremely High", "God-Tier"]:
+            suggestions.append("You're effectively attacking while handling high pressure. Focus on maintaining this balance and look for opportunities to overwhelm opponents.")
+        elif vs_apm_category in ["High", "Extremely High", "God-Tier"] and app_category in ["Low", "Below Average", "Average"]:
+            suggestions.append("You're handling high pressure but could improve your attack efficiency. Work on building and executing attacks more effectively under pressure.")
+        elif vs_apm_category in ["Low", "Below Average", "Average"] and app_category in ["High", "Extremely High", "God-Tier"]:
+            suggestions.append("Your attacks are highly efficient, but you're not under much pressure. Practice maintaining this efficiency against stronger opponents or in faster-paced games.")
+        elif vs_apm_category in ["Low", "Below Average", "Average"] and app_category in ["Low", "Below Average", "Average"]:
+            suggestions.append("You're not under much pressure, but your attacks could be more efficient. Focus on improving your offensive capabilities to control the game better.")
+
+        if vs_apm_category in ["High", "Extremely High", "God-Tier"] and ge_category in ["High", "Extremely High", "God-Tier"]:
+            suggestions.append("You're excellently managing high amounts of garbage. Work on offensive strategies to reduce incoming attacks while maintaining this efficiency.")
+        elif vs_apm_category in ["High", "Extremely High", "God-Tier"] and ge_category in ["Low", "Below Average", "Average"]:
+            suggestions.append("You're under high pressure and could improve your garbage management. Focus on more efficient downstacking techniques.")
+        elif vs_apm_category in ["Low", "Below Average", "Average"] and ge_category in ["High", "Extremely High", "God-Tier"]:
+            suggestions.append("Your garbage efficiency is high, but you're not under much pressure. Prepare for handling higher pressure situations while maintaining this efficiency.")
+        elif vs_apm_category in ["Low", "Below Average", "Average"] and ge_category in ["Low", "Below Average", "Average"]:
+            suggestions.append("You're not under much pressure, but could improve garbage efficiency. Work on downstacking techniques to prepare for higher-pressure games.")
+
+        if pps_category in ["High", "Extremely High", "God-Tier"] and app_category in ["Low", "Below Average"]:
+            suggestions.append("Your speed is excellent, but your attack efficiency could improve. Focus on converting your quick placements into more effective attacks.")
+        elif app_category in ["High", "Extremely High", "God-Tier"] and pps_category in ["Low", "Below Average"]:
+            suggestions.append("Your attack efficiency is high, but overall speed is low. Work on increasing PPS while maintaining strong attack patterns.")
+
+        return suggestions[:5]
+
+    def update_stats_display(self, stats, winner=None):
+        self.player_stats_widget.update_stats(stats, winner)
 
     def update_graphs(self, stats):
         self.radar_chart.set_data(stats)
@@ -870,12 +930,19 @@ class ReplayAnalyzer(QMainWindow):
 
     def on_round_select(self, index):
         if self.current_file:
-            round_stats, overall_stats = self.all_game_data[self.current_file]
+            data = self.all_game_data[self.current_file]
+            if len(data) == 3:
+                round_stats, overall_stats, winner = data
+            else:
+                round_stats, overall_stats = data
+                winner = None
+
             if index == self.round_selector.count() - 1:
-                self.update_stats_display(overall_stats)
+                self.update_stats_display(overall_stats, winner)
                 self.update_graphs(overall_stats)
             else:
-                self.update_stats_display(round_stats[index])
+                round_winner = max(round_stats[index], key=lambda x: round_stats[index][x]['VS Score'])
+                self.update_stats_display(round_stats[index], round_winner)
                 self.update_graphs(round_stats[index])
 
     def analyze_selected_files(self):
@@ -883,45 +950,67 @@ class ReplayAnalyzer(QMainWindow):
         if not selected_items:
             return
 
-        self.clear_player_profiles()  # Clear existing profiles
+        self.clear_player_profiles()
+
+        file_paths = [os.path.join(self.current_folder, item.text()) for item in selected_items]
+        
+        progress = QProgressDialog("Analyzing replays...", "Cancel", 0, len(file_paths), self)
+        progress.setWindowModality(Qt.WindowModal)
 
         combined_stats = {}
-        for item in selected_items:
-            file_name = item.text()
-            file_path = os.path.join(self.current_folder, file_name)
-            if file_name not in self.all_game_data:
-                processor = FileProcessor(file_path)
-                processor.run()
-                round_stats, overall_stats = processor.result
-                self.all_game_data[file_name] = (round_stats, overall_stats)
-            else:
-                _, overall_stats = self.all_game_data[file_name]
+        overall_winner = None
+        total_wins = {}
 
-            for player, stats in overall_stats.items():
-                if player not in combined_stats:
-                    combined_stats[player] = {stat: [] for stat in stats}
-                for stat, value in stats.items():
-                    combined_stats[player][stat].append(value)
-
+        for i, batch_results in enumerate(batch_process_files(file_paths, self.cache_dir)):
+            for result in batch_results:
+                if result:
+                    round_stats, overall_stats, winner = result
+                    for player, stats in overall_stats.items():
+                        if player not in combined_stats:
+                            combined_stats[player] = {stat: [] for stat in stats}
+                            total_wins[player] = 0
+                        for stat, value in stats.items():
+                            combined_stats[player][stat].append(value)
+                        if player == winner:
+                            total_wins[player] += 1
+            
+            progress.setValue(i * 10)  # Assuming batch size of 10
+            if progress.wasCanceled():
+                break
+            
         for player in combined_stats:
             for stat in combined_stats[player]:
                 combined_stats[player][stat] = sum(combined_stats[player][stat]) / len(combined_stats[player][stat])
 
-        self.update_stats_display(combined_stats)
+        if total_wins:
+            overall_winner = max(total_wins, key=total_wins.get)
+
+        progress.setValue(len(file_paths))
+
+        self.update_stats_display(combined_stats, overall_winner)
         self.update_graphs(combined_stats)
         self.update_player_profiles(combined_stats)
         self.update_player_profiles_display()
+    
+    def reprocess_all_files(self):
+        if not self.current_folder:
+            return
 
-    def keyPressEvent(self, event):
-        if self.file_list.hasFocus():
-            current_row = self.file_list.currentRow()
-            if event.key() == Qt.Key_Up and current_row > 0:
-                self.file_list.setCurrentRow(current_row - 1)
-                self.on_file_select(self.file_list.currentItem())
-            elif event.key() == Qt.Key_Down and current_row < self.file_list.count() - 1:
-                self.file_list.setCurrentRow(current_row + 1)
-                self.on_file_select(self.file_list.currentItem())
-        super().keyPressEvent(event)
+        progress = QProgressDialog("Reprocessing all files...", "Cancel", 0, len(self.all_game_data), self)
+        progress.setWindowModality(Qt.WindowModal)
+
+        for i, file_name in enumerate(self.all_game_data.keys()):
+            file_path = os.path.join(self.current_folder, file_name)
+            result = process_file(file_path, self.cache_dir)
+            if result:
+                self.all_game_data[file_name] = result
+
+            progress.setValue(i)
+            if progress.wasCanceled():
+                break
+
+        progress.setValue(len(self.all_game_data))
+        QMessageBox.information(self, "Reprocessing Complete", "All files have been reprocessed with the new format.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
