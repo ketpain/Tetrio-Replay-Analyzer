@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 import numpy as np
+import concurrent.futures
 
 # Define the ranges for each statistic
 STAT_RANGES = {
@@ -183,11 +184,11 @@ def process_file(file_path, cache_dir):
 def batch_process_files(file_paths, cache_dir, batch_size=10):
     os.makedirs(cache_dir, exist_ok=True)
     
-    with multiprocessing.Pool() as pool:
+    with concurrent.futures.ProcessPoolExecutor() as executor:
         process_func = partial(process_file, cache_dir=cache_dir)
         for i in range(0, len(file_paths), batch_size):
             batch = file_paths[i:i+batch_size]
-            yield pool.map(process_func, batch)
+            yield list(executor.map(process_func, batch))
 
 class RadarChart(QWidget):
     def __init__(self, parent=None):
@@ -684,15 +685,22 @@ class ReplayAnalyzer(QMainWindow):
     def filter_players(self):
         filter_text = self.player_filter.text().lower()
         if self.current_file:
-            round_stats, overall_stats = self.all_game_data[self.current_file]
+            data = self.all_game_data[self.current_file]
+            if len(data) == 3:
+                round_stats, overall_stats, winner = data
+            else:
+                round_stats, overall_stats = data
+                winner = None
+
             filtered_stats = {player: stats for player, stats in overall_stats.items() if filter_text in player.lower()}
-            self.update_stats_display(filtered_stats)
+            self.update_stats_display(filtered_stats, winner)
             self.update_graphs(filtered_stats)
 
             current_round = self.round_selector.currentIndex()
             if current_round < len(round_stats):
                 filtered_round_stats = {player: stats for player, stats in round_stats[current_round].items() if filter_text in player.lower()}
-                self.update_stats_display(filtered_round_stats)
+                round_winner = max(filtered_round_stats, key=lambda x: filtered_round_stats[x]['VS Score']) if filtered_round_stats else None
+                self.update_stats_display(filtered_round_stats, round_winner)
                 self.update_graphs(filtered_round_stats)
 
     def display_results(self, file_name):
