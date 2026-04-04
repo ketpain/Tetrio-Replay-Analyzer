@@ -2,14 +2,13 @@ import sys
 import os
 import json
 import colorsys
-import multiprocessing
-from functools import partial
+import hashlib
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QListWidget, QPushButton, QLabel, QComboBox, QFileDialog, 
-                             QHeaderView, QSplitter, QGridLayout, QFrame, QTableWidget, QTableWidgetItem,
+                             QSplitter, QTableWidget, QTableWidgetItem,
                              QAbstractItemView, QTabWidget, QLineEdit, QScrollArea, QDialog, QFormLayout, QDoubleSpinBox,
-                             QProgressBar, QMessageBox,QProgressDialog)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+                             QMessageBox, QProgressDialog)
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 import numpy as np
 import concurrent.futures
@@ -42,10 +41,10 @@ def normalize_stat(value, stat_name):
         return 0.5
     return min(max((value - min_val) / (max_val - min_val), 0), 1)
 
-def calculate_garbage_efficiency(pps, ds_per_second, app):
-    if pps <= 0 or app <= 0:
+def calculate_garbage_efficiency(app, ds_per_piece):
+    if app <= 0 or ds_per_piece <= 0:
         return 0
-    return ((app*ds_per_second) / pps) * 2
+    return (app * ds_per_piece) * 2
 
 def calculate_app(apm, pps):
     if pps <= 0 or apm <= 0:
@@ -63,6 +62,42 @@ def calculate_ds_per_second(vs, apm):
 
 def calculate_damage_potential(pps, app, ge):
     return pps * (1 + app) * (1 + ge)
+
+def build_cache_file_path(file_path, cache_dir):
+    normalized_path = os.path.normcase(os.path.abspath(file_path))
+    cache_key = hashlib.sha256(normalized_path.encode('utf-8')).hexdigest()
+    return os.path.join(cache_dir, f"{cache_key}.cache")
+
+def get_file_signature(file_path):
+    file_stats = os.stat(file_path)
+    return {
+        'path': os.path.abspath(file_path),
+        'size': file_stats.st_size,
+        'mtime_ns': file_stats.st_mtime_ns
+    }
+
+def load_cached_result(file_path, cache_dir):
+    cache_file = build_cache_file_path(file_path, cache_dir)
+    if not os.path.exists(cache_file):
+        return None
+
+    try:
+        with open(cache_file, 'r', encoding='utf-8') as cache_handle:
+            cached_data = json.load(cache_handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(cached_data, dict):
+        return None
+
+    if cached_data.get('source') != get_file_signature(file_path):
+        return None
+
+    result = cached_data.get('result')
+    if not isinstance(result, list) or len(result) != 3:
+        return None
+
+    return tuple(result)
 
 class PlayerProfile:
     def __init__(self, username):
@@ -107,62 +142,63 @@ class PlayerProfile:
                            'total_games': wins['wins'] + wins['losses']}
                 for opponent, wins in self.matchups.items()}
 
-def process_file(file_path, cache_dir):
+def process_file(file_path, cache_dir, force_reprocess=False):
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        cache_file = os.path.join(cache_dir, f"{os.path.basename(file_path)}.cache")
-        
-        if os.path.exists(cache_file):
-            with open(cache_file, 'r') as f:
-                cached_data = json.load(f)
-                if len(cached_data) == 3:  # Check if the cached data has winner information
-                    return cached_data
-                # If not, we'll reprocess the file
-        
-        with open(file_path, 'r') as f:
-            data = json.load(f)
+        cache_file = build_cache_file_path(file_path, cache_dir)
+
+        if not force_reprocess:
+            cached_result = load_cached_result(file_path, cache_dir)
+            if cached_result is not None:
+                return cached_result
+
+        with open(file_path, 'r', encoding='utf-8') as replay_file:
+            data = json.load(replay_file)
 
         round_stats = []
         overall_stats = {}
         winner = None
 
-        if 'replay' in data:
+        replay_data = data.get('replay')
+        if isinstance(replay_data, dict):
             # Determine the winner
-            if 'leaderboard' in data['replay']:
-                leaderboard = data['replay']['leaderboard']
+            leaderboard = replay_data.get('leaderboard', [])
+            if leaderboard:
                 winner = max(leaderboard, key=lambda x: x['wins'])['username']
 
-            if 'rounds' in data['replay']:
-                for round_index, round_data in enumerate(data['replay']['rounds'], 1):
-                    round_stats.append({})
-                    for player_data in round_data:
-                        stats = player_data['stats']
-                        username = player_data['username']
-                        pps = stats['pps']
-                        apm = stats['apm']
-                        vs = stats['vsscore']
-                        app = calculate_app(apm, pps)
-                        ds_per_piece = calculate_ds_per_piece(vs, apm, pps)
-                        ds_per_second = calculate_ds_per_second(vs, apm)
-                        garbage_efficiency = calculate_garbage_efficiency(pps, ds_per_piece, app)
-                        damage_potential = calculate_damage_potential(pps, app, garbage_efficiency)
+            for round_data in replay_data.get('rounds', []):
+                round_result = {}
+                for player_data in round_data:
+                    stats = player_data['stats']
+                    username = player_data['username']
+                    pps = stats['pps']
+                    apm = stats['apm']
+                    vs = stats['vsscore']
+                    app = calculate_app(apm, pps)
+                    ds_per_piece = calculate_ds_per_piece(vs, apm, pps)
+                    ds_per_second = calculate_ds_per_second(vs, apm)
+                    garbage_efficiency = calculate_garbage_efficiency(app, ds_per_piece)
+                    damage_potential = calculate_damage_potential(pps, app, garbage_efficiency)
 
-                        round_stats[-1][username] = {
-                            'PPS': pps,
-                            'APM': apm,
-                            'VS Score': vs,
-                            'APP': app,
-                            'DS/Piece': ds_per_piece,
-                            'DS/Second': ds_per_second,
-                            'Garbage Efficiency': garbage_efficiency,
-                            'Damage Potential': damage_potential
-                        }
+                    round_result[username] = {
+                        'PPS': pps,
+                        'APM': apm,
+                        'VS Score': vs,
+                        'APP': app,
+                        'DS/Piece': ds_per_piece,
+                        'DS/Second': ds_per_second,
+                        'Garbage Efficiency': garbage_efficiency,
+                        'Damage Potential': damage_potential
+                    }
 
-                        if username not in overall_stats:
-                            overall_stats[username] = {stat: [] for stat in round_stats[-1][username]}
+                    if username not in overall_stats:
+                        overall_stats[username] = {stat: [] for stat in round_result[username]}
 
-                        for stat, value in round_stats[-1][username].items():
-                            overall_stats[username][stat].append(value)
+                    for stat, value in round_result[username].items():
+                        overall_stats[username][stat].append(value)
+
+                if round_result:
+                    round_stats.append(round_result)
 
         else:
             raise ValueError("Unknown replay format")
@@ -172,23 +208,17 @@ def process_file(file_path, cache_dir):
                 overall_stats[username][stat] = sum(overall_stats[username][stat]) / len(overall_stats[username][stat])
 
         result = (round_stats, overall_stats, winner)
-        
-        with open(cache_file, 'w') as f:
-            json.dump(result, f)
+
+        with open(cache_file, 'w', encoding='utf-8') as cache_handle:
+            json.dump({
+                'source': get_file_signature(file_path),
+                'result': result
+            }, cache_handle)
         
         return result
     except Exception as e:
         print(f"Error processing file {file_path}: {str(e)}")
-        return [], {}, None  # Return empty data and None for winner in case of error
-
-def batch_process_files(file_paths, cache_dir, batch_size=10):
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        process_func = partial(process_file, cache_dir=cache_dir)
-        for i in range(0, len(file_paths), batch_size):
-            batch = file_paths[i:i+batch_size]
-            yield list(executor.map(process_func, batch))
+        return None
 
 class RadarChart(QWidget):
     def __init__(self, parent=None):
@@ -513,21 +543,88 @@ class ReplayAnalyzer(QMainWindow):
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.layout.addWidget(self.main_splitter)
 
+        self.all_game_data = {}
+        self.current_analysis = None
+        self.current_file = None
+        self.current_folder = None
+        self.player_profiles = {}
+
         self.create_file_browser()
         self.create_stats_view()
 
         self.main_splitter.setSizes([200, 1000])
-
-        self.all_game_data = {}
-        self.current_file = None
-        self.current_folder = None
-        self.player_profiles = {}
-        self.cache_dir = "replay_cache"
+        self.clear_analysis_view()
 
     def create_large_font(self):
         font = QFont()
         font.setPointSize(12)
         return font
+
+    def set_current_analysis(self, overall_stats, winner=None, round_stats=None, current_file=None):
+        self.current_analysis = {
+            'round_stats': round_stats or [],
+            'overall_stats': overall_stats or {},
+            'winner': winner
+        }
+        self.current_file = current_file
+
+        round_items = [f"Round {i+1}" for i in range(len(self.current_analysis['round_stats']))]
+        round_items.append("Average")
+
+        self.round_selector.blockSignals(True)
+        self.round_selector.clear()
+        self.round_selector.addItems(round_items)
+        self.round_selector.setCurrentIndex(len(round_items) - 1)
+        self.round_selector.setEnabled(True)
+        self.round_selector.blockSignals(False)
+
+    def clear_analysis_view(self):
+        self.current_analysis = None
+        self.current_file = None
+
+        self.round_selector.blockSignals(True)
+        self.round_selector.clear()
+        self.round_selector.setEnabled(False)
+        self.round_selector.blockSignals(False)
+
+        self.update_stats_display({})
+        self.update_graphs({})
+
+    def filter_stats(self, stats):
+        filter_text = self.player_filter.text().strip().lower()
+        if not filter_text:
+            return stats
+
+        return {
+            player: player_stats
+            for player, player_stats in stats.items()
+            if filter_text in player.lower()
+        }
+
+    def apply_current_view(self):
+        if not self.current_analysis:
+            self.update_stats_display({})
+            self.update_graphs({})
+            return
+
+        round_stats = self.current_analysis['round_stats']
+        overall_stats = self.current_analysis['overall_stats']
+        winner = self.current_analysis['winner']
+        round_index = self.round_selector.currentIndex()
+
+        if not round_stats or round_index < 0 or round_index >= len(round_stats):
+            display_stats = overall_stats
+            display_winner = winner
+        else:
+            display_stats = round_stats[round_index]
+            display_winner = max(display_stats, key=lambda player: display_stats[player]['VS Score']) if display_stats else None
+
+        filtered_stats = self.filter_stats(display_stats)
+        if display_winner not in filtered_stats:
+            display_winner = None
+
+        self.update_stats_display(filtered_stats, display_winner)
+        self.update_graphs(filtered_stats)
 
     def manual_input(self):
         dialog = ManualInputDialog(self)
@@ -541,7 +638,7 @@ class ReplayAnalyzer(QMainWindow):
             app = calculate_app(apm, pps)
             ds_per_piece = calculate_ds_per_piece(vs, apm, pps)
             ds_per_second = calculate_ds_per_second(vs, apm)
-            garbage_efficiency = calculate_garbage_efficiency(pps, ds_per_piece, app)
+            garbage_efficiency = calculate_garbage_efficiency(app, ds_per_piece)
             damage_potential = calculate_damage_potential(pps, app, garbage_efficiency)
 
             manual_stats.update({
@@ -552,8 +649,11 @@ class ReplayAnalyzer(QMainWindow):
                 'Damage Potential': damage_potential
             })
 
-            self.update_stats_display({'Manual Input': manual_stats})
-            self.update_graphs({'Manual Input': manual_stats})
+            self.clear_player_profiles()
+            self.set_current_analysis({'Manual Input': manual_stats})
+            self.apply_current_view()
+            self.update_player_profiles({'Manual Input': manual_stats})
+            self.update_player_profiles_display()
 
     def create_file_browser(self):
         file_frame = QWidget()
@@ -572,6 +672,9 @@ class ReplayAnalyzer(QMainWindow):
         analyze_button = QPushButton("Analyze Selected")
         analyze_button.clicked.connect(self.analyze_selected_files)
 
+        reprocess_button = QPushButton("Rebuild Cache")
+        reprocess_button.clicked.connect(self.reprocess_all_files)
+
         manual_input_button = QPushButton("Manual Input")
         manual_input_button.clicked.connect(self.manual_input)
 
@@ -579,6 +682,7 @@ class ReplayAnalyzer(QMainWindow):
         button_layout.addWidget(select_button)
         button_layout.addWidget(refresh_button)
         button_layout.addWidget(analyze_button)
+        button_layout.addWidget(reprocess_button)
         button_layout.addWidget(manual_input_button)
 
         file_layout.addWidget(QLabel("Replay Files"))
@@ -607,65 +711,61 @@ class ReplayAnalyzer(QMainWindow):
         charts_splitter.addWidget(self.radar_chart)
         charts_splitter.addWidget(self.attack_defense_speed_chart)
     
-        splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.player_stats_widget)
-        splitter.addWidget(charts_splitter)
-        splitter.setSizes([200, 400])
+        content_splitter = QSplitter(Qt.Vertical)
+        content_splitter.addWidget(self.player_stats_widget)
+        content_splitter.addWidget(charts_splitter)
+        content_splitter.setSizes([200, 400])
     
         self.profile_tabs = QTabWidget()
-    
+
+        main_splitter = QSplitter(Qt.Vertical)
+        main_splitter.addWidget(content_splitter)
+        main_splitter.addWidget(self.profile_tabs)
+        main_splitter.setSizes([400, 200])
+
         stats_layout.addWidget(QLabel("Replay Stats"))
         stats_layout.addWidget(self.player_filter)
         stats_layout.addWidget(self.round_selector)
-        stats_layout.addWidget(splitter)
-        stats_layout.addWidget(self.profile_tabs)
-    
-        self.main_splitter.addWidget(stats_frame)
-
-        main_splitter = QSplitter(Qt.Vertical)
-        main_splitter.addWidget(splitter)
-        main_splitter.addWidget(self.profile_tabs)
-        main_splitter.setSizes([400, 200])
-    
         stats_layout.addWidget(main_splitter)
-    
+
         self.main_splitter.addWidget(stats_frame)
 
     def refresh_files(self):
         if self.current_folder:
+            file_names = sorted(
+                file_name for file_name in os.listdir(self.current_folder)
+                if file_name.endswith('.ttrm')
+            )
             self.file_list.clear()
-            for file_name in os.listdir(self.current_folder):
-                if file_name.endswith('.ttrm'):
-                    self.file_list.addItem(file_name)
+            for file_name in file_names:
+                self.file_list.addItem(file_name)
+
+            if self.current_file and self.current_file not in file_names:
+                self.clear_player_profiles()
+                self.clear_analysis_view()
 
     def select_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder_path:
             self.current_folder = folder_path
+            self.all_game_data = {}
+            self.clear_player_profiles()
+            self.clear_analysis_view()
             self.refresh_files()
 
     def on_file_selection_changed(self):
         selected_items = self.file_list.selectedItems()
         if len(selected_items) == 1:
             self.on_file_select(selected_items[0])
-        elif len(selected_items) > 1:
-            self.clear_player_profiles()
-            self.player_stats_widget.update_stats({})
-            self.radar_chart.set_data({})
-            self.attack_defense_speed_chart.set_data({})
-            self.round_selector.clear()
         else:
             self.clear_player_profiles()
-            self.player_stats_widget.update_stats({})
-            self.radar_chart.set_data({})
-            self.attack_defense_speed_chart.set_data({})
-            self.round_selector.clear()
+            self.clear_analysis_view()
 
     def on_file_select(self, item):
         file_name = item.text()
         file_path = os.path.join(self.current_folder, file_name)
         result = process_file(file_path, self.cache_dir)
-        if result:
+        if result is not None:
             self.all_game_data[file_name] = result
             self.display_results(file_name)
         else:
@@ -683,43 +783,14 @@ class ReplayAnalyzer(QMainWindow):
             self.profile_tabs.removeTab(0)
 
     def filter_players(self):
-        filter_text = self.player_filter.text().lower()
-        if self.current_file:
-            data = self.all_game_data[self.current_file]
-            if len(data) == 3:
-                round_stats, overall_stats, winner = data
-            else:
-                round_stats, overall_stats = data
-                winner = None
-
-            filtered_stats = {player: stats for player, stats in overall_stats.items() if filter_text in player.lower()}
-            self.update_stats_display(filtered_stats, winner)
-            self.update_graphs(filtered_stats)
-
-            current_round = self.round_selector.currentIndex()
-            if current_round < len(round_stats):
-                filtered_round_stats = {player: stats for player, stats in round_stats[current_round].items() if filter_text in player.lower()}
-                round_winner = max(filtered_round_stats, key=lambda x: filtered_round_stats[x]['VS Score']) if filtered_round_stats else None
-                self.update_stats_display(filtered_round_stats, round_winner)
-                self.update_graphs(filtered_round_stats)
+        self.apply_current_view()
 
     def display_results(self, file_name):
-        self.current_file = file_name
-        data = self.all_game_data[file_name]
-        if len(data) == 3:
-            round_stats, overall_stats, winner = data
-        else:
-            round_stats, overall_stats = data
-            winner = None
+        round_stats, overall_stats, winner = self.all_game_data[file_name]
 
         self.clear_player_profiles()
-
-        self.round_selector.clear()
-        self.round_selector.addItems([f"Round {i+1}" for i in range(len(round_stats))] + ["Average"])
-        self.round_selector.setCurrentIndex(len(round_stats))
-
-        self.update_stats_display(overall_stats, winner)
-        self.update_graphs(overall_stats)
+        self.set_current_analysis(overall_stats, winner, round_stats, current_file=file_name)
+        self.apply_current_view()
         self.update_player_profiles(overall_stats)
         self.update_player_profiles_display()
 
@@ -937,21 +1008,7 @@ class ReplayAnalyzer(QMainWindow):
         self.attack_defense_speed_chart.update()
 
     def on_round_select(self, index):
-        if self.current_file:
-            data = self.all_game_data[self.current_file]
-            if len(data) == 3:
-                round_stats, overall_stats, winner = data
-            else:
-                round_stats, overall_stats = data
-                winner = None
-
-            if index == self.round_selector.count() - 1:
-                self.update_stats_display(overall_stats, winner)
-                self.update_graphs(overall_stats)
-            else:
-                round_winner = max(round_stats[index], key=lambda x: round_stats[index][x]['VS Score'])
-                self.update_stats_display(round_stats[index], round_winner)
-                self.update_graphs(round_stats[index])
+        self.apply_current_view()
 
     def analyze_selected_files(self):
         selected_items = self.file_list.selectedItems()
@@ -964,28 +1021,78 @@ class ReplayAnalyzer(QMainWindow):
         
         progress = QProgressDialog("Analyzing replays...", "Cancel", 0, len(file_paths), self)
         progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
 
         combined_stats = {}
         overall_winner = None
         total_wins = {}
+        failed_files = []
+        canceled = False
 
-        for i, batch_results in enumerate(batch_process_files(file_paths, self.cache_dir)):
-            for result in batch_results:
-                if result:
-                    round_stats, overall_stats, winner = result
+        executor = concurrent.futures.ProcessPoolExecutor()
+        futures = {
+            executor.submit(process_file, file_path, self.cache_dir): file_path
+            for file_path in file_paths
+        }
+
+        try:
+            completed_files = 0
+            while futures:
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    canceled = True
+                    break
+
+                done, _ = concurrent.futures.wait(
+                    list(futures.keys()),
+                    timeout=0.1,
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                if not done:
+                    continue
+
+                for future in done:
+                    file_path = futures.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        print(f"Error processing file {file_path}: {str(exc)}")
+                        result = None
+
+                    completed_files += 1
+                    progress.setValue(completed_files)
+
+                    if result is None:
+                        failed_files.append(os.path.basename(file_path))
+                        continue
+
+                    self.all_game_data[os.path.basename(file_path)] = result
+                    _, overall_stats, winner = result
                     for player, stats in overall_stats.items():
                         if player not in combined_stats:
                             combined_stats[player] = {stat: [] for stat in stats}
                             total_wins[player] = 0
                         for stat, value in stats.items():
                             combined_stats[player][stat].append(value)
-                        if player == winner:
-                            total_wins[player] += 1
-            
-            progress.setValue(i * 10)  # Assuming batch size of 10
-            if progress.wasCanceled():
-                break
-            
+
+                    if winner in total_wins:
+                        total_wins[winner] += 1
+
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        canceled = True
+                        break
+        finally:
+            if canceled:
+                for future in futures:
+                    future.cancel()
+            executor.shutdown(wait=not canceled, cancel_futures=canceled)
+
+        if canceled:
+            progress.cancel()
+            return
+             
         for player in combined_stats:
             for stat in combined_stats[player]:
                 combined_stats[player][stat] = sum(combined_stats[player][stat]) / len(combined_stats[player][stat])
@@ -995,30 +1102,82 @@ class ReplayAnalyzer(QMainWindow):
 
         progress.setValue(len(file_paths))
 
-        self.update_stats_display(combined_stats, overall_winner)
-        self.update_graphs(combined_stats)
+        if not combined_stats:
+            self.clear_analysis_view()
+            if failed_files:
+                failed_summary = ", ".join(failed_files[:5])
+                if len(failed_files) > 5:
+                    failed_summary += ", ..."
+                QMessageBox.warning(
+                    self,
+                    "Analysis Failed",
+                    f"Failed to process the selected replay files: {failed_summary}"
+                )
+            return
+
+        self.set_current_analysis(combined_stats, overall_winner)
+        self.apply_current_view()
         self.update_player_profiles(combined_stats)
         self.update_player_profiles_display()
+
+        if failed_files:
+            failed_summary = ", ".join(failed_files[:5])
+            if len(failed_files) > 5:
+                failed_summary += ", ..."
+            QMessageBox.warning(
+                self,
+                "Partial Analysis Complete",
+                f"Failed to process {len(failed_files)} file(s): {failed_summary}"
+            )
     
     def reprocess_all_files(self):
         if not self.current_folder:
             return
 
-        progress = QProgressDialog("Reprocessing all files...", "Cancel", 0, len(self.all_game_data), self)
+        file_names = sorted(
+            file_name for file_name in os.listdir(self.current_folder)
+            if file_name.endswith('.ttrm')
+        )
+        if not file_names:
+            QMessageBox.information(self, "No Files", "No replay files were found in the selected folder.")
+            return
+
+        progress = QProgressDialog("Rebuilding replay cache...", "Cancel", 0, len(file_names), self)
         progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        failed_files = []
+        canceled = False
 
-        for i, file_name in enumerate(self.all_game_data.keys()):
-            file_path = os.path.join(self.current_folder, file_name)
-            result = process_file(file_path, self.cache_dir)
-            if result:
-                self.all_game_data[file_name] = result
-
-            progress.setValue(i)
+        for index, file_name in enumerate(file_names, start=1):
+            QApplication.processEvents()
             if progress.wasCanceled():
+                canceled = True
                 break
 
-        progress.setValue(len(self.all_game_data))
-        QMessageBox.information(self, "Reprocessing Complete", "All files have been reprocessed with the new format.")
+            file_path = os.path.join(self.current_folder, file_name)
+            result = process_file(file_path, self.cache_dir, force_reprocess=True)
+            if result is not None:
+                self.all_game_data[file_name] = result
+            else:
+                failed_files.append(file_name)
+
+            progress.setValue(index)
+
+        if canceled:
+            progress.cancel()
+            return
+
+        if self.current_file and self.current_file in self.all_game_data:
+            self.display_results(self.current_file)
+
+        if failed_files:
+            QMessageBox.warning(
+                self,
+                "Rebuild Complete",
+                f"Rebuilt cache with {len(failed_files)} failure(s)."
+            )
+        else:
+            QMessageBox.information(self, "Rebuild Complete", "Replay cache rebuilt for all files in the current folder.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
